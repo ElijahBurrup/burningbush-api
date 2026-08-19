@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: burningbush-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: burningbush-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ALLOWED_ORIGIN
+        value: https://kingdombuilders.ai
+      - key: APP_URL
+        value: https://kingdombuilders.ai/burningbush
+      # - key: SENDGRID_API_KEY   (set in dashboard to enable password-reset emails)
+      # - key: MAIL_FROM          (verified sender, e.g. dj@accreditationnow.com)
+
+databases:
+  - name: burningbush-db
+    plan: free
