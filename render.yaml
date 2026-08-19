@@ -1,3 +1,6 @@
+# burningbush-api reuses the SHARED Kingdom Builders Postgres (kb-playbooks-db) — no new database.
+# Data is schema-isolated: USERS_SCHEMA=kb (shared identity), DATA_SCHEMA=burningbush (this product).
+# Provisioned via the Render API; env vars (incl. DATABASE_URL from kb-playbooks-db) set on the service.
 services:
   - type: web
     name: burningbush-api
@@ -7,19 +10,19 @@ services:
     startCommand: node server.js
     healthCheckPath: /api/health
     envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: burningbush-db
-          property: connectionString
+      - key: DATABASE_URL      # internal connection string of kb-playbooks-db (shared)
+        sync: false
+      - key: USERS_SCHEMA
+        value: kb
+      - key: DATA_SCHEMA
+        value: burningbush
+      - key: PRODUCT
+        value: burningbush
       - key: JWT_SECRET
         generateValue: true
       - key: ALLOWED_ORIGIN
         value: https://kingdombuilders.ai
       - key: APP_URL
         value: https://kingdombuilders.ai/burningbush
-      # - key: SENDGRID_API_KEY   (set in dashboard to enable password-reset emails)
-      # - key: MAIL_FROM          (verified sender, e.g. dj@accreditationnow.com)
-
-databases:
-  - name: burningbush-db
-    plan: free
+      # - key: SENDGRID_API_KEY  (optional: enables password-reset emails)
+      # - key: MAIL_FROM         (verified sender)
