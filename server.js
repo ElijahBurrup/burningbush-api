@@ -20,7 +20,8 @@ app.use(express.json({ limit: '4mb' }));
 
 const ORIGINS = (process.env.ALLOWED_ORIGIN || 'https://kingdombuilders.ai')
   .split(',').map(s => s.trim()).filter(Boolean);
-app.use(cors({ origin(o, cb) { cb(null, !o || ORIGINS.includes(o)); } }));
+// exact-match allowlist; ALLOWED_ORIGIN="*" opens it (used only by the QA sandbox, which holds no real data)
+app.use(cors({ origin(o, cb) { cb(null, !o || ORIGINS.includes('*') || ORIGINS.includes(o)); } }));
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 // schema names come from env; sanitize hard since they're interpolated into DDL
