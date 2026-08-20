@@ -61,6 +61,14 @@ async function initDb() {
       updated_at BIGINT DEFAULT 0,
       saved_at TIMESTAMPTZ DEFAULT now()
     );
+    -- admin overlay for support tickets. Tickets themselves live inside each user's prog_json blob
+    -- (client-owned), so their reviewed/deleted status is tracked here, keyed by a stable ticket key.
+    CREATE TABLE IF NOT EXISTS "${D}".ticket_status (
+      ticket_key TEXT PRIMARY KEY,
+      done BOOLEAN DEFAULT false,
+      deleted BOOLEAN DEFAULT false,
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
   `);
 }
 
@@ -156,6 +164,72 @@ app.post('/api/reset', limit(10, 60000), async (req, res) => {
     await pool.query(`DELETE FROM "${U}".reset_tokens WHERE token=$1`, [token]);
     res.json({ ok: true });
   } catch (e) { console.error('reset', e); res.status(500).json({ error: 'Server error.' }); }
+});
+
+// ---- admin: cross-user support-ticket review -----------------------------------------------
+// Only the admin account may list/triage every user's tickets. Tickets are extracted live from each
+// user's prog_json (source of truth); done/deleted state is overlaid from D.ticket_status.
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'elijah@kingdombuilders.ai')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+function adminAuth(req, res, next) {
+  const t = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  try {
+    const u = jwt.verify(t, JWT_SECRET);
+    if (!ADMIN_EMAILS.includes((u.email || '').toLowerCase()))
+      return res.status(403).json({ error: 'Admins only.' });
+    req.user = u; next();
+  } catch { res.status(401).json({ error: 'Please sign in again.' }); }
+}
+// a stable key for a ticket: owner-email + submit-timestamp + type
+const ticketKey = (email, t) => `${(email || '').toLowerCase()}|${t.ts}|${t.type || ''}`;
+
+app.get('/api/admin/tickets', adminAuth, async (req, res) => {
+  try {
+    const wantType = (req.query.type || '').trim(); // e.g. "bug"; empty = all types
+    const rows = (await pool.query(
+      `SELECT u.email, p.prog_json FROM "${D}".progress p JOIN "${U}".users u ON u.id = p.user_id`
+    )).rows;
+    const st = {};
+    (await pool.query(`SELECT ticket_key, done, deleted FROM "${D}".ticket_status`)).rows
+      .forEach(r => { st[r.ticket_key] = r; });
+    const out = [];
+    for (const row of rows) {
+      let prog; try { prog = JSON.parse(row.prog_json || '{}'); } catch { continue; }
+      const tickets = Array.isArray(prog.tickets) ? prog.tickets : [];
+      for (const t of tickets) {
+        if (wantType && t.type !== wantType) continue;
+        const key = ticketKey(row.email, t);
+        const s = st[key] || {};
+        if (s.deleted) continue;
+        out.push({ key, email: row.email, type: t.type || '', text: t.text || '',
+                   recipient: t.recipient || '', ts: t.ts || 0, done: !!s.done });
+      }
+    }
+    out.sort((a, b) => b.ts - a.ts); // newest first
+    res.json({ tickets: out });
+  } catch (e) { console.error('admin-tickets', e); res.status(500).json({ error: 'Server error.' }); }
+});
+
+app.post('/api/admin/tickets/status', adminAuth, async (req, res) => {
+  try {
+    const key = String(req.body.key || ''); const done = !!req.body.done;
+    if (!key) return res.status(400).json({ error: 'Missing key.' });
+    await pool.query(
+      `INSERT INTO "${D}".ticket_status(ticket_key, done, updated_at) VALUES($1,$2,now())
+       ON CONFLICT(ticket_key) DO UPDATE SET done=$2, updated_at=now()`, [key, done]);
+    res.json({ ok: true });
+  } catch (e) { console.error('admin-status', e); res.status(500).json({ error: 'Server error.' }); }
+});
+
+app.post('/api/admin/tickets/delete', adminAuth, async (req, res) => {
+  try {
+    const key = String(req.body.key || '');
+    if (!key) return res.status(400).json({ error: 'Missing key.' });
+    await pool.query(
+      `INSERT INTO "${D}".ticket_status(ticket_key, deleted, updated_at) VALUES($1,true,now())
+       ON CONFLICT(ticket_key) DO UPDATE SET deleted=true, updated_at=now()`, [key]);
+    res.json({ ok: true });
+  } catch (e) { console.error('admin-delete', e); res.status(500).json({ error: 'Server error.' }); }
 });
 
 async function sendReset(email, tok) {
