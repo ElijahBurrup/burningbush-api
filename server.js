@@ -90,6 +90,111 @@ const limit = (max, windowMs) => (req, res, next) => {
   next();
 };
 
+/* ---- licensed scripture, proxied ---------------------------------------------------------------
+   The NLT is Tyndale's and cannot ship inside the app the way the public domain texts do, so it is
+   read through api.bible a chapter at a time. Two reasons this lives on the server rather than in
+   the client: the api.bible key never reaches a browser, and one cache here serves every reader, so
+   a chapter is fetched from api.bible once no matter how many people open it.
+
+   The cache is deliberately bounded. It is a cache, not a copy of the Bible.                     */
+const BIBLE_KEY = process.env.BIBLE_API_KEY || '';
+const BIBLE_IDS = { nlt: process.env.BIBLE_NLT_ID || 'd6e14a625393b4da-01' };
+const USFM = ('GEN EXO LEV NUM DEU JOS JDG RUT 1SA 2SA 1KI 2KI 1CH 2CH EZR NEH EST JOB PSA PRO ECC SNG ' +
+  'ISA JER LAM EZK DAN HOS JOL AMO OBA JON MIC NAM HAB ZEP HAG ZEC MAL MAT MRK LUK JHN ACT ROM 1CO 2CO ' +
+  'GAL EPH PHP COL 1TH 2TH 1TI 2TI TIT PHM HEB JAS 1PE 2PE 1JN 2JN 3JN JUD REV').split(' ');
+
+const CHAP_MAX = 600;                       // ~half a Bible; oldest evicted first
+const chapCache = new Map();                // "nlt:43:3" -> {verses, copyright}
+const chapHit = (k) => { const v = chapCache.get(k); if (v) { chapCache.delete(k); chapCache.set(k, v); } return v; };
+const chapPut = (k, v) => { chapCache.set(k, v); while (chapCache.size > CHAP_MAX) chapCache.delete(chapCache.keys().next().value); };
+const inflight = new Map();                 // one upstream call per chapter, however many ask at once
+
+// Text nodes carry attrs.verseId only sometimes; the <verse> tag is always present and always in
+// document order, so it is the cursor. (Keying on verseId silently dropped whole quoted passages.)
+function versesFrom(content) {
+  const out = new Map();          // num -> {text, block}
+  let cur = null, block = 0;
+  (function walk(n) {
+    if (Array.isArray(n)) return n.forEach(walk);
+    if (!n || typeof n !== 'object') return;
+    if (n.type === 'tag' && n.name === 'verse') {
+      if (n.attrs && n.attrs.style === 've') { cur = null; return; }
+      const num = n.attrs && (n.attrs.number || String(n.attrs.sid || '').split(':')[1]);
+      cur = num ? String(num).split('-')[0] : cur;
+      return;
+    }
+    // Each line of poetry is its own para and carries no whitespace of its own, so crossing one is
+    // a word boundary. Runs inside the same para (italics, divine name) must NOT gain a space.
+    if (n.type === 'tag' && n.name === 'para') block++;
+    if (n.type === 'text') {
+      const k = (n.attrs && n.attrs.verseId) ? String(n.attrs.verseId).split('.')[2] : cur;
+      if (!k) return;
+      const prev = out.get(k);
+      let t = n.text;
+      if (prev && prev.block !== block && !/\s$/.test(prev.text) && !/^\s/.test(t)) t = ' ' + t;
+      out.set(k, { text: (prev ? prev.text : '') + t, block });
+      return;
+    }
+    if (n.items) walk(n.items);
+  })(content);
+  const flat = new Map();
+  for (const [k, v] of out) flat.set(k, v.text);
+  return flat;
+}
+
+async function fetchChapter(trans, book, chapter) {
+  const key = trans + ':' + book + ':' + chapter;
+  const hit = chapHit(key);
+  if (hit) return hit;
+  if (inflight.has(key)) return inflight.get(key);
+  const p = (async () => {
+    const id = BIBLE_IDS[trans];
+    const url = 'https://rest.api.bible/v1/bibles/' + id + '/chapters/' + USFM[book - 1] + '.' + chapter +
+      '?content-type=json&include-notes=false&include-titles=false&include-chapter-numbers=false&include-verse-spans=false';
+    const r = await fetch(url, { headers: { 'api-key': BIBLE_KEY } });
+    if (!r.ok) throw new Error('upstream ' + r.status);
+    const j = await r.json();
+    const m = versesFrom(j.data.content);
+    const verses = [];
+    for (const [num, text] of m) {
+      const n = Number(num);
+      if (n > 0) verses[n - 1] = String(text).replace(/\s+/g, ' ').trim();
+    }
+    for (let i = 0; i < verses.length; i++) if (verses[i] == null) verses[i] = '';
+    const out = { verses, copyright: (j.data.copyright || '').trim() };
+    chapPut(key, out);
+    return out;
+  })().finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
+
+// One chapter, or several in one round trip: ?refs=43.3,19.23 keeps a page load to a single request.
+app.get('/api/bible/:trans', limit(240, 60000), async (req, res) => {
+  const trans = String(req.params.trans || '').toLowerCase();
+  if (!BIBLE_IDS[trans]) return res.status(404).json({ error: 'unknown translation' });
+  if (!BIBLE_KEY) return res.status(503).json({ error: 'scripture api not configured' });
+  const refs = String(req.query.refs || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 40);
+  if (!refs.length) return res.status(400).json({ error: 'refs required, e.g. refs=43.3,19.23' });
+  const bad = refs.find(r => !/^\d{1,2}\.\d{1,3}$/.test(r));
+  if (bad) return res.status(400).json({ error: 'bad ref ' + bad });
+  try {
+    const out = {};
+    let copyright = '';
+    await Promise.all(refs.map(async r => {
+      const [b, c] = r.split('.').map(Number);
+      if (b < 1 || b > 66 || c < 1) return;
+      const got = await fetchChapter(trans, b, c);
+      out[r] = got.verses;
+      copyright = copyright || got.copyright;
+    }));
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.json({ trans, chapters: out, copyright });
+  } catch (e) {
+    res.status(502).json({ error: 'scripture unavailable' });
+  }
+});
+
 app.get('/api/health', (req, res) => res.json({ ok: true, product: PRODUCT, users: U, data: D }));
 
 app.post('/api/signup', limit(10, 60000), async (req, res) => {

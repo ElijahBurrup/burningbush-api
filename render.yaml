@@ -24,5 +24,9 @@ services:
         value: https://kingdombuilders.ai
       - key: APP_URL
         value: https://kingdombuilders.ai/burningbush
+      - key: BIBLE_API_KEY     # api.bible key; without it /api/bible returns 503 and the app stays on KJV
+        sync: false
+      - key: BIBLE_NLT_ID
+        value: d6e14a625393b4da-01
       # - key: SENDGRID_API_KEY  (optional: enables password-reset emails)
       # - key: MAIL_FROM         (verified sender)
