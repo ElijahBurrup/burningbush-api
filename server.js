@@ -127,6 +127,10 @@ async function saveSub(userId, sub, plan) {
   const item = (sub.items && sub.items.data && sub.items.data[0]) || {};
   const price = item.price || {};
   const known = plan || (price.recurring && price.recurring.interval === 'month' ? 'monthly' : 'yearly');
+  // Stripe moved current_period_end off the subscription and onto the item. Read the item first and
+  // fall back, so both shapes work — this field is the backstop that stops a stale 'active' row
+  // granting Pro for ever if a renewal webhook is ever missed.
+  const periodEnd = item.current_period_end || sub.current_period_end || null;
   await pool.query(
     `INSERT INTO "${D}".subscriptions
        (user_id, customer_id, subscription_id, status, plan, period_end, cancel_at_period_end, updated_at)
@@ -136,7 +140,7 @@ async function saveSub(userId, sub, plan) {
        status=EXCLUDED.status, plan=EXCLUDED.plan, period_end=EXCLUDED.period_end,
        cancel_at_period_end=EXCLUDED.cancel_at_period_end, updated_at=now()`,
     [userId, String(sub.customer || ''), String(sub.id || ''), String(sub.status || ''),
-     known, sub.current_period_end || null, !!sub.cancel_at_period_end]);
+     known, periodEnd, !!sub.cancel_at_period_end]);
 }
 
 // The user this event belongs to. A checkout carries it outright; later events carry only Stripe's
