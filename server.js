@@ -16,6 +16,30 @@ const crypto = require('crypto');
 
 const app = express();
 app.set('trust proxy', 1);
+
+/* ---- billing ------------------------------------------------------------------------------------
+   Stripe signs each webhook over the EXACT bytes it sent. express.json() replaces req.body with a
+   parsed object and throws the bytes away, so the signature can never be checked afterwards — the
+   webhook route therefore takes express.raw and is mounted BEFORE the JSON parser below. Mounting it
+   after is the classic way to get a billing integration that silently rejects every event.        */
+const STRIPE_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_WH  = process.env.STRIPE_WEBHOOK_SECRET || '';
+const stripe = STRIPE_KEY ? require('stripe')(STRIPE_KEY) : null;
+const PRICES = { yearly: process.env.STRIPE_PRICE_YEARLY || '', monthly: process.env.STRIPE_PRICE_MONTHLY || '' };
+const PORTAL_CFG = process.env.STRIPE_PORTAL_CONFIG || '';
+
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !STRIPE_WH) return res.status(503).send('billing not configured');
+  let ev;
+  try { ev = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WH); }
+  catch (err) { return res.status(400).send('bad signature: ' + err.message); }
+  // Answer first. Stripe retries anything not acknowledged inside its timeout, and a slow database
+  // write is not a reason to be sent the same event again.
+  res.json({ received: true });
+  try { await handleStripeEvent(ev); }
+  catch (err) { console.error('[stripe] ' + ev.type + ' failed:', err.message); }
+});
+
 app.use(express.json({ limit: '4mb' }));
 
 const ORIGINS = (process.env.ALLOWED_ORIGIN || 'https://kingdombuilders.ai')
@@ -63,6 +87,21 @@ async function initDb() {
     );
     -- admin overlay for support tickets. Tickets themselves live inside each user's prog_json blob
     -- (client-owned), so their reviewed/deleted status is tracked here, keyed by a stable ticket key.
+    -- Who has actually paid. One row per user: a person has one subscription to this product, and
+    -- resubscribing after a lapse overwrites rather than accumulating.
+    CREATE TABLE IF NOT EXISTS "${D}".subscriptions (
+      user_id BIGINT PRIMARY KEY REFERENCES "${U}".users(id) ON DELETE CASCADE,
+      customer_id TEXT,
+      subscription_id TEXT,
+      status TEXT,                       -- active | trialing | past_due | canceled | incomplete…
+      plan TEXT,                         -- yearly | monthly
+      period_end BIGINT,                 -- unix seconds; when the paid-for stretch runs out
+      cancel_at_period_end BOOLEAN DEFAULT false,
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+    -- the webhook usually knows the customer or the subscription, not the user
+    CREATE INDEX IF NOT EXISTS subs_customer ON "${D}".subscriptions(customer_id);
+    CREATE INDEX IF NOT EXISTS subs_subscription ON "${D}".subscriptions(subscription_id);
     CREATE TABLE IF NOT EXISTS "${D}".ticket_status (
       ticket_key TEXT PRIMARY KEY,
       done BOOLEAN DEFAULT false,
@@ -70,6 +109,63 @@ async function initDb() {
       updated_at TIMESTAMPTZ DEFAULT now()
     );
   `);
+}
+
+/* Two statuses count as paid. Stripe keeps a subscription "active" through a pending cancellation —
+   cancel_at_period_end is a flag on an otherwise live subscription — so someone who has cancelled
+   keeps what they bought until the period they paid for actually ends. */
+const PAID = new Set(['active', 'trialing']);
+const GRACE = 36 * 3600;   // seconds. Covers a late renewal webhook rather than locking someone out.
+
+function isPaid(row) {
+  if (!row || !PAID.has(row.status)) return false;
+  if (row.period_end && Number(row.period_end) + GRACE < Math.floor(Date.now() / 1000)) return false;
+  return true;
+}
+
+async function saveSub(userId, sub, plan) {
+  const item = (sub.items && sub.items.data && sub.items.data[0]) || {};
+  const price = item.price || {};
+  const known = plan || (price.recurring && price.recurring.interval === 'month' ? 'monthly' : 'yearly');
+  await pool.query(
+    `INSERT INTO "${D}".subscriptions
+       (user_id, customer_id, subscription_id, status, plan, period_end, cancel_at_period_end, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7, now())
+     ON CONFLICT (user_id) DO UPDATE SET
+       customer_id=EXCLUDED.customer_id, subscription_id=EXCLUDED.subscription_id,
+       status=EXCLUDED.status, plan=EXCLUDED.plan, period_end=EXCLUDED.period_end,
+       cancel_at_period_end=EXCLUDED.cancel_at_period_end, updated_at=now()`,
+    [userId, String(sub.customer || ''), String(sub.id || ''), String(sub.status || ''),
+     known, sub.current_period_end || null, !!sub.cancel_at_period_end]);
+}
+
+// The user this event belongs to. A checkout carries it outright; later events carry only Stripe's
+// own ids, so they are matched against the row the checkout wrote.
+async function userForEvent(o) {
+  if (o.client_reference_id && /^\d+$/.test(String(o.client_reference_id))) return Number(o.client_reference_id);
+  if (o.metadata && o.metadata.uid && /^\d+$/.test(String(o.metadata.uid))) return Number(o.metadata.uid);
+  const byId = o.id && (await pool.query(`SELECT user_id FROM "${D}".subscriptions WHERE subscription_id=$1`, [String(o.id)])).rows[0];
+  if (byId) return Number(byId.user_id);
+  const byCust = o.customer && (await pool.query(`SELECT user_id FROM "${D}".subscriptions WHERE customer_id=$1`, [String(o.customer)])).rows[0];
+  return byCust ? Number(byCust.user_id) : null;
+}
+
+async function handleStripeEvent(ev) {
+  const o = ev.data.object;
+  if (ev.type === 'checkout.session.completed') {
+    const uid = await userForEvent(o);
+    if (!uid) return console.error('[stripe] checkout with no account attached:', o.id);
+    if (!o.subscription) return;                       // a one-off payment is not a subscription
+    const sub = await stripe.subscriptions.retrieve(String(o.subscription));
+    await saveSub(uid, sub, (o.metadata && o.metadata.plan) || null);
+    return;
+  }
+  if (ev.type === 'customer.subscription.updated' || ev.type === 'customer.subscription.deleted') {
+    const uid = await userForEvent(o);
+    if (!uid) return console.error('[stripe] ' + ev.type + ' for an unknown account:', o.id);
+    // a deleted subscription arrives with its final status; record it rather than guessing
+    await saveSub(uid, o, (o.metadata && o.metadata.plan) || null);
+  }
 }
 
 const sign = u => jwt.sign({ uid: Number(u.id), email: u.email }, JWT_SECRET, { expiresIn: '365d' });
@@ -193,6 +289,66 @@ app.get('/api/bible/:trans', limit(240, 60000), async (req, res) => {
   } catch (e) {
     res.status(502).json({ error: 'scripture unavailable' });
   }
+});
+
+/* The one answer the app trusts. Everything about Pro in the browser is a cache of this. */
+app.get('/api/entitlement', auth, async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM "${D}".subscriptions WHERE user_id=$1`, [req.user.uid]);
+    const row = r.rows[0];
+    res.json({
+      pro: isPaid(row),
+      plan: row ? row.plan : null,
+      status: row ? row.status : null,
+      until: row && row.period_end ? Number(row.period_end) * 1000 : null,
+      cancelAtPeriodEnd: row ? !!row.cancel_at_period_end : false
+    });
+  } catch (e) { res.status(500).json({ error: 'Could not read your subscription.' }); }
+});
+
+/* Checkout is opened by the server so the account is attached to the payment by us rather than by a
+   query parameter the browser could be talked out of. client_reference_id is the thread the webhook
+   follows back to this user. */
+app.post('/api/checkout', auth, limit(20, 60000), async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Checkout is not set up yet.' });
+  const plan = req.body && req.body.plan === 'monthly' ? 'monthly' : 'yearly';
+  const price = PRICES[plan];
+  if (!price) return res.status(503).json({ error: 'That plan is not set up yet.' });
+  const app_url = process.env.APP_URL || 'https://kingdombuilders.ai/burningbush';
+  try {
+    const prior = await pool.query(`SELECT customer_id FROM "${D}".subscriptions WHERE user_id=$1`, [req.user.uid]);
+    const s = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price, quantity: 1 }],
+      client_reference_id: String(req.user.uid),
+      // reuse the customer if they have subscribed before, so one person is one customer in Stripe
+      ...(prior.rows[0] && prior.rows[0].customer_id
+        ? { customer: prior.rows[0].customer_id }
+        : { customer_email: req.user.email }),
+      metadata: { uid: String(req.user.uid), plan },
+      subscription_data: { metadata: { uid: String(req.user.uid), plan } },
+      allow_promotion_codes: true,
+      success_url: app_url + '?checkout=success',
+      cancel_url: app_url + '?checkout=cancelled'
+    });
+    res.json({ url: s.url });
+  } catch (e) { console.error('[stripe] checkout:', e.message); res.status(500).json({ error: 'Could not open checkout.' }); }
+});
+
+/* Manage or cancel. A session is made for this user, so there is no shared link to guess. */
+app.post('/api/portal', auth, limit(20, 60000), async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Billing is not set up yet.' });
+  try {
+    const r = await pool.query(`SELECT customer_id FROM "${D}".subscriptions WHERE user_id=$1`, [req.user.uid]);
+    const cust = r.rows[0] && r.rows[0].customer_id;
+    if (!cust) return res.status(404).json({ error: 'No subscription to manage yet.' });
+    const s = await stripe.billingPortal.sessions.create({
+      customer: cust,
+      ...(PORTAL_CFG ? { configuration: PORTAL_CFG } : {}),
+      return_url: process.env.APP_URL || 'https://kingdombuilders.ai/burningbush'
+    });
+    res.json({ url: s.url });
+  } catch (e) { console.error('[stripe] portal:', e.message); res.status(500).json({ error: 'Could not open the billing page.' }); }
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, product: PRODUCT, users: U, data: D }));
