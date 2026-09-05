@@ -824,7 +824,10 @@ app.post('/api/reset', limit(10, 60000), async (req, res) => {
 // ---- admin: cross-user support-ticket review -----------------------------------------------
 // Only the admin account may list/triage every user's tickets. Tickets are extracted live from each
 // user's prog_json (source of truth); done/deleted state is overlaid from D.ticket_status.
-const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'elijah@kingdombuilders.ai')
+// Must match ADMIN_EMAILS in the app. They had drifted apart: the app showed the Admin tools to
+// these two, and the server then refused every call those tools made, because its own default was
+// a third address nobody signs in with. Admin review was open and broken at the same time.
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'elijahdburrup@gmail.com,erinburrup@gmail.com')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 function adminAuth(req, res, next) {
   const t = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
