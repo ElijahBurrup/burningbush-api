@@ -26,6 +26,12 @@ const STRIPE_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_WH  = process.env.STRIPE_WEBHOOK_SECRET || '';
 const stripe = STRIPE_KEY ? require('stripe')(STRIPE_KEY) : null;
 const PRICES = { yearly: process.env.STRIPE_PRICE_YEARLY || '', monthly: process.env.STRIPE_PRICE_MONTHLY || '' };
+// A group licence: five seats, one year, renewing. Bought in any quantity — ten of them is fifty
+// seats on ten codes, which is how somebody sponsors a whole camp.
+const GROUP_PRICE = process.env.STRIPE_PRICE_GROUP || '';
+const GROUP_SEATS = Number(process.env.GROUP_SEATS || 5);
+// Giving money to the assistance pool, in whatever amount the giver chooses.
+const GIFT_PRICE = process.env.STRIPE_PRICE_GIFT || '';
 const PORTAL_CFG = process.env.STRIPE_PORTAL_CONFIG || '';
 
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -42,8 +48,15 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
 
 app.use(express.json({ limit: '4mb' }));
 
+// The phone app is served from inside itself, not from the site: Capacitor gives the WebView its
+// own origin, and every call from the app is therefore cross-origin and needs saying yes to here.
+// These three are what the shells actually send — https://localhost on Android with the https
+// scheme, and the two capacitor:// spellings iOS and older Android use. They are not addresses
+// anybody else can claim: nothing on the internet can be served from them.
+const APP_ORIGINS = ['https://localhost', 'capacitor://localhost', 'ionic://localhost'];
 const ORIGINS = (process.env.ALLOWED_ORIGIN || 'https://kingdombuilders.ai')
-  .split(',').map(s => s.trim()).filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean)
+  .concat(APP_ORIGINS);
 // exact-match allowlist; ALLOWED_ORIGIN="*" opens it (used only by the QA sandbox, which holds no real data)
 app.use(cors({ origin(o, cb) { cb(null, !o || ORIGINS.includes('*') || ORIGINS.includes(o)); } }));
 
@@ -102,6 +115,42 @@ async function initDb() {
     -- the webhook usually knows the customer or the subscription, not the user
     CREATE INDEX IF NOT EXISTS subs_customer ON "${D}".subscriptions(customer_id);
     CREATE INDEX IF NOT EXISTS subs_subscription ON "${D}".subscriptions(subscription_id);
+    -- A group licence. One row per purchase; the code is what gets handed around.
+    CREATE TABLE IF NOT EXISTS "${D}".licences (
+      id BIGSERIAL PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      owner_id BIGINT REFERENCES "${U}".users(id) ON DELETE SET NULL,
+      seats INT NOT NULL DEFAULT 5,
+      customer_id TEXT,
+      subscription_id TEXT,
+      status TEXT DEFAULT 'active',      -- active | canceled
+      term_end BIGINT,                   -- unix seconds; seats die with the term
+      assignments INT DEFAULT 0,         -- lifetime, for the churn cap
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+    -- Who holds a seat, and who used to. Released rows are KEPT: they are the audit trail behind
+    -- the churn cap and the cooling-off period, and they are what an owner sees as history.
+    CREATE TABLE IF NOT EXISTS "${D}".licence_seats (
+      id BIGSERIAL PRIMARY KEY,
+      licence_id BIGINT NOT NULL REFERENCES "${D}".licences(id) ON DELETE CASCADE,
+      user_id BIGINT REFERENCES "${U}".users(id) ON DELETE CASCADE,
+      email TEXT,
+      claimed_at TIMESTAMPTZ DEFAULT now(),
+      released_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS seats_licence ON "${D}".licence_seats(licence_id);
+    CREATE INDEX IF NOT EXISTS seats_user ON "${D}".licence_seats(user_id) WHERE released_at IS NULL;
+    -- Every movement of sponsorship money. Positive in, negative out; the balance is the sum.
+    CREATE TABLE IF NOT EXISTS "${D}".pool_ledger (
+      id BIGSERIAL PRIMARY KEY,
+      kind TEXT NOT NULL,                -- gift | grant | refund
+      cents BIGINT NOT NULL,
+      user_id BIGINT REFERENCES "${U}".users(id) ON DELETE SET NULL,
+      payment_id TEXT,                   -- the Stripe payment, so one webhook cannot credit twice
+      note TEXT,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS pool_payment ON "${D}".pool_ledger(payment_id) WHERE payment_id IS NOT NULL;
     CREATE TABLE IF NOT EXISTS "${D}".ticket_status (
       ticket_key TEXT PRIMARY KEY,
       done BOOLEAN DEFAULT false,
@@ -159,6 +208,54 @@ async function handleStripeEvent(ev) {
   if (ev.type === 'checkout.session.completed') {
     const uid = await userForEvent(o);
     if (!uid) return console.error('[stripe] checkout with no account attached:', o.id);
+    const kind = (o.metadata && o.metadata.kind) || '';
+
+    // Group licences: one code per licence bought, each with its own seats and its own year.
+    if (kind === 'group') {
+      const qty = Math.max(1, Math.min(50, parseInt((o.metadata && o.metadata.qty) || '1', 10) || 1));
+      let termEnd = null;
+      if (o.subscription) {
+        try {
+          const sub = await stripe.subscriptions.retrieve(String(o.subscription));
+          const item = sub.items && sub.items.data && sub.items.data[0];
+          termEnd = (item && item.current_period_end) || sub.current_period_end || null;
+        } catch (e) { console.error('[stripe] group term:', e.message); }
+      }
+      if (!termEnd) termEnd = Math.floor(Date.now() / 1000) + 365 * 24 * 3600;
+      for (let i = 0; i < qty; i++) {
+        // A minted code can collide, however unlikely; try again rather than lose the purchase.
+        for (let attempt = 0; attempt < 6; attempt++) {
+          try {
+            await pool.query(
+              `INSERT INTO "${D}".licences(code, owner_id, seats, customer_id, subscription_id, term_end)
+               VALUES($1,$2,$3,$4,$5,$6)`,
+              [mintCode(), uid, GROUP_SEATS, o.customer || null, o.subscription || null, termEnd]);
+            break;
+          } catch (e) {
+            if (attempt === 5) console.error('[stripe] could not mint a licence code:', e.message);
+          }
+        }
+      }
+      console.log('[stripe] minted', qty, 'group licence(s) for', uid);
+      return;
+    }
+
+    // A gift: credit the pool by what was actually paid, keyed on the payment so a retried webhook
+    // cannot credit it twice.
+    if (kind === 'gift') {
+      const cents = Number(o.amount_total || 0);
+      if (cents > 0) {
+        try {
+          await pool.query(
+            `INSERT INTO "${D}".pool_ledger(kind, cents, user_id, payment_id, note)
+             VALUES('gift',$1,$2,$3,$4) ON CONFLICT (payment_id) DO NOTHING`,
+            [cents, uid, String(o.payment_intent || o.id), 'gift via checkout']);
+          console.log('[stripe] pool credited', cents, 'cents from', uid);
+        } catch (e) { console.error('[stripe] pool credit:', e.message); }
+      }
+      return;
+    }
+
     if (!o.subscription) return;                       // a one-off payment is not a subscription
     const sub = await stripe.subscriptions.retrieve(String(o.subscription));
     await saveSub(uid, sub, (o.metadata && o.metadata.plan) || null);
@@ -300,12 +397,18 @@ app.get('/api/entitlement', auth, async (req, res) => {
   try {
     const r = await pool.query(`SELECT * FROM "${D}".subscriptions WHERE user_id=$1`, [req.user.uid]);
     const row = r.rows[0];
+    // A seat on somebody's group licence is Pro just as much as paying for it yourself. Their own
+    // subscription wins if they have both, because that is the one they are being charged for.
+    const seat = isPaid(row) ? null : await seatEntitlement(req.user.uid);
     res.json({
-      pro: isPaid(row),
-      plan: row ? row.plan : null,
-      status: row ? row.status : null,
-      until: row && row.period_end ? Number(row.period_end) * 1000 : null,
-      cancelAtPeriodEnd: row ? !!row.cancel_at_period_end : false
+      pro: isPaid(row) || !!seat,
+      plan: isPaid(row) ? row.plan : (seat ? 'group-seat' : (row ? row.plan : null)),
+      status: isPaid(row) ? row.status : (seat ? 'active' : (row ? row.status : null)),
+      until: isPaid(row)
+        ? (row.period_end ? Number(row.period_end) * 1000 : null)
+        : (seat && seat.term_end ? Number(seat.term_end) * 1000 : null),
+      seatCode: seat ? seat.code : null,
+      cancelAtPeriodEnd: isPaid(row) ? !!row.cancel_at_period_end : false
     });
   } catch (e) { res.status(500).json({ error: 'Could not read your subscription.' }); }
 });
@@ -318,7 +421,9 @@ app.post('/api/checkout', auth, limit(20, 60000), async (req, res) => {
   const plan = req.body && req.body.plan === 'monthly' ? 'monthly' : 'yearly';
   const price = PRICES[plan];
   if (!price) return res.status(503).json({ error: 'That plan is not set up yet.' });
-  const app_url = process.env.APP_URL || 'https://kingdombuilders.ai/burningbush';
+  // The old /burningbush path is gone; a return that lands on a 404 looks exactly like a failed
+  // payment to the person who just paid.
+  const app_url = process.env.APP_URL || 'https://burningbush.kingdombuilders.ai/app';
   try {
     const prior = await pool.query(`SELECT customer_id FROM "${D}".subscriptions WHERE user_id=$1`, [req.user.uid]);
     const s = await stripe.checkout.sessions.create({
@@ -402,6 +507,291 @@ app.put('/api/sync', auth, async (req, res) => {
       [req.user.uid, progJson || null, srsJson || null, updatedAt]);
     res.json({ ok: true });
   } catch (e) { console.error('sync-put', e); res.status(500).json({ error: 'Server error.' }); }
+});
+
+/* Delete the account and everything attached to it.
+   Required by both app stores, and the requirement is deletion rather than deactivation.
+
+   The password is asked for again even though the caller is already signed in: this is the one
+   action in the app that cannot be undone, and a session left open on a shared machine should not
+   be enough to destroy somebody's work.
+
+   TWO SCOPES, because the identity is shared.
+
+     scope=product   (the default) removes everything Burning Bush holds and cancels the billing.
+                     The Kingdom Builders sign-in survives, so the other products are untouched.
+     scope=identity  also removes the shared sign-in, ending access to every Kingdom Builders app.
+
+   The default is the narrow one: somebody deleting a Bible-memory app is not usually asking to lose
+   an unrelated product they still use. The wide one exists because the stores require that an
+   account created in the app can be deleted from the app, and data-gone-but-account-alive is not
+   that. It is offered, never assumed. */
+app.post('/api/account/delete', auth, limit(6, 60000), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const pw = req.body.password || '';
+    const confirm = (req.body.email || '').trim().toLowerCase();
+
+    const r = await client.query(`SELECT id, email, pw_hash FROM "${U}".users WHERE id=$1`, [req.user.uid]);
+    if (!r.rows.length) return res.status(404).json({ error: 'That account no longer exists.' });
+    const u = r.rows[0];
+    if (confirm !== String(u.email).toLowerCase())
+      return res.status(400).json({ error: 'Type your email address exactly to confirm.' });
+    if (!(await bcrypt.compare(pw, u.pw_hash)))
+      return res.status(401).json({ error: 'Incorrect password.' });
+
+    // Stop the money first. If this fails the deletion still goes ahead — an account that no longer
+    // exists must not keep being charged, and a stranded Stripe subscription is recoverable by hand
+    // where a half-deleted account is not.
+    let billing = 'none';
+    try {
+      const s = await client.query(`SELECT subscription_id FROM "${D}".subscriptions WHERE user_id=$1`, [u.id]);
+      const subId = s.rows.length && s.rows[0].subscription_id;
+      if (subId && stripe) { await stripe.subscriptions.cancel(subId); billing = 'cancelled'; }
+      else if (subId) billing = 'unreachable';
+    } catch (e) { console.error('delete-cancel-sub', e && e.message); billing = 'failed'; }
+
+    const wide = String(req.body.scope || 'product') === 'identity';
+
+    await client.query('BEGIN');
+    await client.query(`DELETE FROM "${D}".progress      WHERE user_id=$1`, [u.id]);
+    await client.query(`DELETE FROM "${D}".subscriptions WHERE user_id=$1`, [u.id]);
+    if (wide) {
+      await client.query(`DELETE FROM "${U}".reset_tokens WHERE user_id=$1`, [u.id]);
+      await client.query(`DELETE FROM "${U}".users        WHERE id=$1`, [u.id]);
+    }
+    await client.query('COMMIT');
+
+    console.log('deleted', wide ? 'identity' : 'product data', 'for', u.id, '· billing:', billing);
+    res.json({ ok: true, billing, scope: wide ? 'identity' : 'product' });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (e2) {}
+    console.error('account-delete', e);
+    res.status(500).json({ error: 'Server error. Nothing was deleted.' });
+  } finally { client.release(); }
+});
+
+/* ---- group licences -------------------------------------------------------------------------
+   A code is read aloud to a room of teenagers, so the alphabet leaves out everything that sounds or
+   looks like something else: no O or 0, no I or 1, no S or 5. */
+const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRTUVWXYZ2346789';
+function mintCode() {
+  const pick = n => Array.from({ length: n }, () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)]).join('');
+  return `BB-${pick(4)}-${pick(4)}`;
+}
+/* A code the owner chose themselves. Not Fort Knox — it is guarded by being unguessable enough that
+   nobody finds it by trying, and by only ever being worth five seats. */
+function codeProblem(code) {
+  const c = String(code || '').trim().toUpperCase();
+  if (c.length < 8) return 'Use at least 8 characters.';
+  if (c.length > 24) return 'Keep it to 24 characters or fewer.';
+  if (!/^[A-Z0-9-]+$/.test(c)) return 'Letters, numbers and dashes only.';
+  if (!/[A-Z]/.test(c)) return 'Include at least one letter.';
+  if (!/[0-9]/.test(c)) return 'Include at least one number.';
+  if (/^(.)\1+$/.test(c.replace(/-/g, ''))) return 'That is the same character over and over.';
+  return null;
+}
+const SEAT_COOLOFF_MS = 7 * 24 * 3600 * 1000;
+const MAX_ASSIGNMENTS = 15;
+
+// Does this user hold a live seat on a live licence? This is what makes a seat count as Pro.
+async function seatEntitlement(uid) {
+  const r = await pool.query(
+    `SELECT l.term_end, l.code FROM "${D}".licence_seats s
+       JOIN "${D}".licences l ON l.id = s.licence_id
+      WHERE s.user_id=$1 AND s.released_at IS NULL AND l.status='active'
+        AND (l.term_end IS NULL OR l.term_end > EXTRACT(EPOCH FROM now()))
+      ORDER BY l.term_end DESC NULLS FIRST LIMIT 1`, [uid]);
+  return r.rows[0] || null;
+}
+
+/* Buy one or more group licences. Quantity is the number of LICENCES, each carrying its own code
+   and its own five seats — so ten is fifty seats on ten codes, which is how a camp gets sponsored. */
+app.post('/api/licence/checkout', auth, limit(20, 60000), async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Checkout is not set up yet.' });
+  if (!GROUP_PRICE) return res.status(503).json({ error: 'Group licences are not set up yet.' });
+  const qty = Math.max(1, Math.min(50, parseInt(req.body && req.body.qty, 10) || 1));
+  const app_url = process.env.APP_URL || 'https://burningbush.kingdombuilders.ai/app';
+  try {
+    const s = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price: GROUP_PRICE, quantity: qty }],
+      client_reference_id: String(req.user.uid),
+      customer_email: req.user.email,
+      metadata: { uid: String(req.user.uid), kind: 'group', qty: String(qty) },
+      subscription_data: { metadata: { uid: String(req.user.uid), kind: 'group', qty: String(qty) } },
+      success_url: app_url + '?checkout=group',
+      cancel_url: app_url + '?checkout=cancelled'
+    });
+    res.json({ url: s.url });
+  } catch (e) { console.error('[stripe] group checkout:', e.message); res.status(500).json({ error: 'Could not open checkout.' }); }
+});
+
+/* Take a seat with a code. */
+app.post('/api/licence/redeem', auth, limit(20, 60000), async (req, res) => {
+  const code = String(req.body && req.body.code || '').trim().toUpperCase();
+  if (!code) return res.status(400).json({ error: 'Enter a code.' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const l = (await client.query(
+      `SELECT * FROM "${D}".licences WHERE upper(code)=$1 FOR UPDATE`, [code])).rows[0];
+    if (!l) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'No licence with that code.' }); }
+    if (l.status !== 'active') { await client.query('ROLLBACK'); return res.status(410).json({ error: 'That licence has ended.' }); }
+    if (l.term_end && Number(l.term_end) * 1000 < Date.now()) { await client.query('ROLLBACK'); return res.status(410).json({ error: 'That licence has expired.' }); }
+
+    const seats = (await client.query(
+      `SELECT * FROM "${D}".licence_seats WHERE licence_id=$1`, [l.id])).rows;
+    const held = seats.filter(s => !s.released_at);
+    if (held.some(s => String(s.user_id) === String(req.user.uid))) {
+      await client.query('ROLLBACK'); return res.status(409).json({ error: 'You already hold a seat on this licence.' });
+    }
+    if (held.length >= l.seats) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'Every seat on that code is taken.' }); }
+    if (Number(l.assignments || 0) >= MAX_ASSIGNMENTS) {
+      await client.query('ROLLBACK'); return res.status(429).json({ error: 'This licence has changed hands too many times this year.' });
+    }
+    const mine = seats.filter(s => String(s.user_id) === String(req.user.uid) && s.released_at);
+    const recent = mine.some(s => Date.now() - new Date(s.released_at).getTime() < SEAT_COOLOFF_MS);
+    if (recent) { await client.query('ROLLBACK'); return res.status(429).json({ error: 'You gave this seat up in the last few days. Try again in a week.' }); }
+
+    await client.query(`INSERT INTO "${D}".licence_seats(licence_id, user_id, email) VALUES($1,$2,$3)`,
+      [l.id, req.user.uid, req.user.email]);
+    await client.query(`UPDATE "${D}".licences SET assignments=assignments+1 WHERE id=$1`, [l.id]);
+    await client.query('COMMIT');
+    res.json({ ok: true, expiresAt: l.term_end ? Number(l.term_end) * 1000 : null, seats: l.seats });
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (e2) {}
+    console.error('licence-redeem', e); res.status(500).json({ error: 'Server error.' });
+  } finally { client.release(); }
+});
+
+/* What the owner sees: every licence they bought, who is on it, and how much each is using it. */
+app.get('/api/licence/mine', auth, async (req, res) => {
+  try {
+    const ls = (await pool.query(
+      `SELECT id, code, seats, status, term_end, assignments FROM "${D}".licences
+        WHERE owner_id=$1 ORDER BY created_at DESC`, [req.user.uid])).rows;
+    if (!ls.length) return res.json({ licences: [] });
+    const ids = ls.map(l => l.id);
+    const seats = (await pool.query(
+      `SELECT s.id, s.licence_id, s.email, s.claimed_at, s.released_at, p.prog_json
+         FROM "${D}".licence_seats s
+         LEFT JOIN "${D}".progress p ON p.user_id = s.user_id
+        WHERE s.licence_id = ANY($1::bigint[]) ORDER BY s.claimed_at`, [ids])).rows;
+    // Activity comes out of the reader's own monthly record, which is the same thing the app draws
+    // its charts from. Counts only — an owner sees how much a seat is used, never what was written.
+    const activity = row => {
+      try {
+        const st = (JSON.parse(row.prog_json || '{}') || {}).stats || {};
+        const keys = Object.keys(st).sort();
+        const last = keys.length ? st[keys[keys.length - 1]] : {};
+        let days = 0, verses = 0, questions = 0;
+        keys.forEach(k => { days += (st[k].d || 0); verses += (st[k].v || 0); questions += (st[k].q || 0); });
+        return { daysThisMonth: last.d || 0, versesAll: verses, questionsAll: questions, daysAll: days };
+      } catch (e) { return { daysThisMonth: 0, versesAll: 0, questionsAll: 0, daysAll: 0 }; }
+    };
+    res.json({
+      licences: ls.map(l => ({
+        code: l.code, seats: l.seats, status: l.status, assignments: l.assignments,
+        expiresAt: l.term_end ? Number(l.term_end) * 1000 : null,
+        held: seats.filter(s => String(s.licence_id) === String(l.id) && !s.released_at)
+          .map(s => ({ seatId: s.id, email: s.email, since: s.claimed_at, ...activity(s) })),
+        past: seats.filter(s => String(s.licence_id) === String(l.id) && s.released_at)
+          .map(s => ({ email: s.email, since: s.claimed_at, until: s.released_at }))
+      }))
+    });
+  } catch (e) { console.error('licence-mine', e); res.status(500).json({ error: 'Server error.' }); }
+});
+
+/* Take a seat back, so it can go to somebody who will use it. */
+app.post('/api/licence/revoke', auth, limit(30, 60000), async (req, res) => {
+  try {
+    const seatId = parseInt(req.body && req.body.seatId, 10);
+    if (!seatId) return res.status(400).json({ error: 'Which seat?' });
+    const r = await pool.query(
+      `UPDATE "${D}".licence_seats s SET released_at=now()
+         FROM "${D}".licences l
+        WHERE s.id=$1 AND s.licence_id=l.id AND l.owner_id=$2 AND s.released_at IS NULL
+        RETURNING s.email`, [seatId, req.user.uid]);
+    if (!r.rows.length) return res.status(404).json({ error: 'That seat is not yours to take back.' });
+    res.json({ ok: true, email: r.rows[0].email });
+  } catch (e) { console.error('licence-revoke', e); res.status(500).json({ error: 'Server error.' }); }
+});
+
+/* Choose the code. Owners want something they can say out loud, and the minted one is awkward. */
+app.post('/api/licence/code', auth, limit(10, 60000), async (req, res) => {
+  try {
+    const oldCode = String(req.body && req.body.from || '').trim().toUpperCase();
+    const next = String(req.body && req.body.code || '').trim().toUpperCase();
+    const bad = codeProblem(next);
+    if (bad) return res.status(400).json({ error: bad });
+    const own = await pool.query(`SELECT id FROM "${D}".licences WHERE upper(code)=$1 AND owner_id=$2`, [oldCode, req.user.uid]);
+    if (!own.rows.length) return res.status(404).json({ error: 'That licence is not yours.' });
+    const taken = await pool.query(`SELECT 1 FROM "${D}".licences WHERE upper(code)=$1 AND id<>$2`, [next, own.rows[0].id]);
+    if (taken.rows.length) return res.status(409).json({ error: 'Somebody already uses that code. Try another.' });
+    await pool.query(`UPDATE "${D}".licences SET code=$1 WHERE id=$2`, [next, own.rows[0].id]);
+    res.json({ ok: true, code: next });
+  } catch (e) { console.error('licence-code', e); res.status(500).json({ error: 'Server error.' }); }
+});
+
+/* ---- the pool -------------------------------------------------------------------------------
+   A gift is a one-off payment of whatever the giver chose. The amount is priced inline here rather
+   than against a fixed Stripe price, so one route covers "any amount", "a year for someone" and
+   "ten licences' worth" without three products to keep in step. The browser sends a number of
+   cents; this clamps it and Stripe charges what this says. */
+app.post('/api/gift/checkout', auth, limit(20, 60000), async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Giving is not set up yet.' });
+  const cents = Math.max(500, Math.min(500000, parseInt(req.body && req.body.cents, 10) || 0));
+  if (!cents) return res.status(400).json({ error: 'Choose an amount.' });
+  const label = String(req.body && req.body.label || 'A gift to the Burning Bush fund').slice(0, 120);
+  const app_url = process.env.APP_URL || 'https://burningbush.kingdombuilders.ai/app';
+  try {
+    const s = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency: 'usd',
+          unit_amount: cents,
+          product_data: { name: 'Burning Bush — sponsorship', description: label }
+        }
+      }],
+      client_reference_id: String(req.user.uid),
+      customer_email: req.user.email,
+      metadata: { uid: String(req.user.uid), kind: 'gift', cents: String(cents) },
+      success_url: app_url + '?checkout=gift',
+      cancel_url: app_url + '?checkout=cancelled'
+    });
+    res.json({ url: s.url });
+  } catch (e) { console.error('[stripe] gift checkout:', e.message); res.status(500).json({ error: 'Could not open checkout.' }); }
+});
+
+/* What the fund holds, and what the giving added up to this month. The only reporting there is:
+   totals, never a person. Cached for a few minutes because it reads every account. */
+let communityCache = { at: 0, data: null };
+app.get('/api/community', limit(120, 60000), async (req, res) => {
+  try {
+    if (communityCache.data && Date.now() - communityCache.at < 5 * 60000) return res.json(communityCache.data);
+    const bal = await pool.query(`SELECT COALESCE(SUM(cents),0) AS c FROM "${D}".pool_ledger`);
+    const gifts = await pool.query(`SELECT COUNT(*) AS n FROM "${D}".pool_ledger WHERE kind='gift'`);
+    const rows = await pool.query(`SELECT prog_json FROM "${D}".progress WHERE prog_json IS NOT NULL`);
+    const month = new Date().toISOString().slice(0, 7);
+    let verses = 0, questions = 0, people = 0;
+    rows.rows.forEach(r => {
+      try {
+        const st = (JSON.parse(r.prog_json) || {}).stats || {};
+        const m = st[month];
+        if (m && ((m.v || 0) || (m.q || 0))) { people++; verses += m.v || 0; questions += m.q || 0; }
+      } catch (e) {}
+    });
+    const data = {
+      month, verses, questions, people,
+      poolCents: Number(bal.rows[0].c || 0),
+      gifts: Number(gifts.rows[0].n || 0)
+    };
+    communityCache = { at: Date.now(), data };
+    res.json(data);
+  } catch (e) { console.error('community', e); res.status(500).json({ error: 'Server error.' }); }
 });
 
 app.post('/api/forgot', limit(6, 60000), async (req, res) => {
