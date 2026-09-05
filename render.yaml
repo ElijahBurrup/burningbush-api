@@ -20,10 +20,10 @@ services:
         value: burningbush
       - key: JWT_SECRET
         generateValue: true
-      - key: ALLOWED_ORIGIN
-        value: https://kingdombuilders.ai
+      # ALLOWED_ORIGIN is optional: the product's own addresses are in server.js (SITE_ORIGINS).
+      # Set it only to add an address the code could not have known about.
       - key: APP_URL
-        value: https://kingdombuilders.ai/burningbush
+        value: https://burningbush.app/app
       - key: BIBLE_API_KEY     # api.bible key; without it /api/bible returns 503 and the app stays on KJV
         sync: false
       - key: BIBLE_NLT_ID

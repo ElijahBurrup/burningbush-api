@@ -54,9 +54,19 @@ app.use(express.json({ limit: '4mb' }));
 // scheme, and the two capacitor:// spellings iOS and older Android use. They are not addresses
 // anybody else can claim: nothing on the internet can be served from them.
 const APP_ORIGINS = ['https://localhost', 'capacitor://localhost', 'ionic://localhost'];
-const ORIGINS = (process.env.ALLOWED_ORIGIN || 'https://kingdombuilders.ai')
+// The addresses this product is served from. In code rather than in ALLOWED_ORIGIN because they
+// are a property of the product, not of a deployment: forgetting one is a site that cannot reach
+// its own API, which is a total outage with no error message worth reading. ALLOWED_ORIGIN still
+// works and still adds to this — it is for the addresses nobody could have known in advance.
+const SITE_ORIGINS = [
+  'https://burningbush.app',
+  'https://www.burningbush.app',
+  'https://burningbush.kingdombuilders.ai',   // the old home; kept so the redirect era is painless
+  'https://kingdombuilders.ai'
+];
+const ORIGINS = (process.env.ALLOWED_ORIGIN || '')
   .split(',').map(s => s.trim()).filter(Boolean)
-  .concat(APP_ORIGINS);
+  .concat(SITE_ORIGINS, APP_ORIGINS);
 // exact-match allowlist; ALLOWED_ORIGIN="*" opens it (used only by the QA sandbox, which holds no real data)
 app.use(cors({ origin(o, cb) { cb(null, !o || ORIGINS.includes('*') || ORIGINS.includes(o)); } }));
 
@@ -891,7 +901,7 @@ app.post('/api/admin/tickets/delete', adminAuth, async (req, res) => {
 });
 
 async function sendReset(email, tok) {
-  const link = `${process.env.APP_URL || 'https://kingdombuilders.ai/burningbush'}?reset=${tok}`;
+  const link = `${process.env.APP_URL || 'https://burningbush.app/app'}?reset=${tok}`;
   if (!process.env.SENDGRID_API_KEY) { console.log('[reset link — SendGrid not set]', email, link); return; }
   try {
     const sg = require('@sendgrid/mail'); sg.setApiKey(process.env.SENDGRID_API_KEY);
