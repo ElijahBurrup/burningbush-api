@@ -111,6 +111,20 @@ function checkDoc(key, doc) {
       if (a.link && !/^https:\/\//.test(a.link)) return 'An announcement link must start with https://.';
     }
   }
+  const isObj = x => x !== null && typeof x === 'object' && !Array.isArray(x);
+  if (key === 'suggested') {
+    for (const f of ['gemsAdd', 'gemsHide']) if (doc[f] != null && !Array.isArray(doc[f])) return f + ' must be a list.';
+    if (doc.psalmFor != null && !isObj(doc.psalmFor)) return 'psalmFor must be an object.';
+    if (doc.topics != null && !Array.isArray(doc.topics)) return 'topics must be a list, or left out.';
+    if (Array.isArray(doc.topics) && doc.topics.some(t => !t || typeof t.name !== 'string' || !t.name.trim())) return 'Every topic needs a name.';
+  }
+  if (key === 'stories') {
+    if (doc.names != null && !isObj(doc.names)) return 'names must be an object.';
+    const ms = doc.milestones;
+    if (ms != null && !isObj(ms)) return 'milestones must be an object.';
+    if (ms && ms.add != null && !Array.isArray(ms.add)) return 'milestones.add must be a list.';
+    if (ms && Array.isArray(ms.add) && ms.add.some(a => !a || !a.id || !a.t || !a.after)) return 'A new milestone needs an id, a title and the section it follows.';
+  }
   return null;
 }
 

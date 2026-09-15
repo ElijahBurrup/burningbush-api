@@ -27,6 +27,13 @@ ok(/link/.test(checkDoc('announcements', [{ id: 'a', text: 'Hi', link: 'http://x
 ok(/list/.test(checkDoc('announcements', {}) || ''), 'announcements must be a list');
 ok(/object/.test(checkDoc('config', []) || ''), 'config must be an object');
 ok(/no document/.test(checkDoc('secrets', {}) || ''), 'an unknown document is refused');
+ok(checkDoc('suggested', { gemsAdd: [{ ref: '19:46:10', cat: 'faith' }], gemsHide: [], psalmFor: { 91: 2 }, topics: null }) === null, 'a good suggested document');
+ok(/topics/.test(checkDoc('suggested', { topics: {} }) || ''), 'topics must be a list');
+ok(/name/.test(checkDoc('suggested', { topics: [{ name: ' ' }] }) || ''), 'a topic needs a name');
+ok(/gemsAdd/.test(checkDoc('suggested', { gemsAdd: 'x' }) || ''), 'gemsAdd must be a list');
+ok(checkDoc('stories', { names: { '1:1:1': 'In the Beginning' }, milestones: { edit: {}, add: [{ id: 'm', t: 'T', after: 'Jacob & Joseph' }] } }) === null, 'a good stories document');
+ok(/section/.test(checkDoc('stories', { milestones: { add: [{ id: 'm', t: 'T' }] } }) || ''), 'a new milestone needs its section');
+ok(/names/.test(checkDoc('stories', { names: [] }) || ''), 'names must be an object');
 
 // ── the seed, as the app will see it ────────────────────────────────────────────────────────────
 const seed = require(path.join(__dirname, '..', 'seed', 'media.json'));
