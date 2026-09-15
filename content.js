@@ -128,6 +128,34 @@ function checkDoc(key, doc) {
   return null;
 }
 
+/* Corrections to the seeded videos, from seed/corrections.json. Each is applied once and remembered
+   by its id in the _corrections row, so a redeploy never undoes what an admin has done since (a
+   video hidden here and put back from the admin screen stays put back). A correction names a video
+   by the reference it is on and its link, then either hides it or moves it to the right verse,
+   with the label that verse needs. */
+async function applyCorrections(pool, D, list) {
+  const row = (await pool.query(`SELECT doc FROM "${D}".content WHERE key='_corrections'`)).rows[0];
+  const done = new Set((row && row.doc && Array.isArray(row.doc.ids)) ? row.doc.ids : []);
+  let applied = 0;
+  for (const k of Array.isArray(list) ? list : []) {
+    if (!k || !k.id || done.has(k.id)) continue;
+    const to = k.move_to ? parseRef(k.move_to) : null;
+    if (!k.hide && (!to || !String(k.label || '').trim())) { console.warn('[content] correction ' + k.id + ' skipped: it needs hide, or move_to with a label'); continue; }
+    const hits = (await pool.query(`SELECT id FROM "${D}".media WHERE ref_key=$1 AND (yt=$2 OR fb=$3)`,
+      [k.ref, k.yt || null, k.fb || null])).rows;
+    for (const h of hits) {
+      if (k.hide) await pool.query(`UPDATE "${D}".media SET active=$1, updated_at=now(), updated_by='correction' WHERE id=$2`, [false, h.id]);
+      else await pool.query(`UPDATE "${D}".media SET ref_key=$1, level=$2, label=$3, updated_at=now(), updated_by='correction' WHERE id=$4`,
+        [to.key, to.level, String(k.label).trim().slice(0, 200), h.id]);
+    }
+    done.add(k.id); applied++;
+    console.log('[content] correction ' + k.id + ': ' + hits.length + ' video(s)');
+  }
+  if (applied) await pool.query(`INSERT INTO "${D}".content(key, doc, updated_by) VALUES('_corrections', $1, 'seed')
+      ON CONFLICT (key) DO UPDATE SET doc=EXCLUDED.doc, updated_at=now(), updated_by='seed'`, [JSON.stringify({ ids: [...done] })]);
+  return applied;
+}
+
 function mountContent(app, { pool, D, adminAuth, limit }) {
   let ready = false;
   let bundle = null;          // { etag, body } — rebuilt after any write
@@ -186,6 +214,9 @@ function mountContent(app, { pool, D, adminAuth, limit }) {
       } catch (e) { await c.query('ROLLBACK').catch(() => {}); throw e; }
       finally { c.release(); }
     }
+    const cfile = path.join(__dirname, 'seed', 'corrections.json');
+    if (fs.existsSync(cfile)) await applyCorrections(pool, D, JSON.parse(fs.readFileSync(cfile, 'utf8')));
+    bundle = null;
     ready = true;
   }
 
@@ -333,4 +364,4 @@ function mountContent(app, { pool, D, adminAuth, limit }) {
   };
 }
 
-module.exports = { mountContent, parseRef, parseUrl, mediaTree, checkDoc, CHAPS };
+module.exports = { applyCorrections, mountContent, parseRef, parseUrl, mediaTree, checkDoc, CHAPS };

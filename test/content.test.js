@@ -6,7 +6,7 @@ const http = require('http');
 const path = require('path');
 const express = require('express');
 const jwt = require('jsonwebtoken');
-const { mountContent, parseRef, parseUrl, mediaTree, checkDoc } = require('../content');
+const { mountContent, parseRef, parseUrl, mediaTree, checkDoc, applyCorrections } = require('../content');
 
 let passed = 0, failed = 0;
 const ok = (c, m) => { if (c) passed++; else { failed++; console.log('  FAIL ' + m); } };
@@ -69,6 +69,9 @@ function fakePool(mediaRows) {
     if (/^INSERT INTO .*content_history/.test(s)) { db.history.push({ id: histId++, key: v[0], doc: JSON.parse(v[1]), version: v[2] }); return { rows: [] }; }
     if (/^INSERT INTO .*content\(key, doc, version/.test(s)) { db.content[v[0]] = { doc: JSON.parse(v[1]), version: v[2] }; return { rows: [] }; }
     if (/^SELECT doc, version FROM .*content_history WHERE id/.test(s)) { const h = db.history.find(x => x.id === v[0] && x.key === v[1]); return { rows: h ? [h] : [] }; }
+    if (/^SELECT doc FROM .*content WHERE key='_corrections'/.test(s)) return { rows: db.content._corrections ? [db.content._corrections] : [] };
+    if (/^SELECT id FROM .*media WHERE ref_key=\$1 AND/.test(s)) return { rows: db.media.filter(r => r.ref_key === v[0] && ((v[1] && r.yt === v[1]) || (v[2] && r.fb === v[2]))) };
+    if (/^INSERT INTO .*content\(key, doc, updated_by\) VALUES\('_corrections'/.test(s)) { db.content._corrections = { doc: JSON.parse(v[0]) }; return { rows: [] }; }
     if (/^(BEGIN|COMMIT|ROLLBACK)/.test(s)) return { rows: [] };
     throw new Error('stand-in pool does not know: ' + s.slice(0, 90));
   };
@@ -92,6 +95,20 @@ const limit = () => (req, res, next) => next();
   ok(pool.db.media.length === 1080, 'the first start loads all 1,080 approved videos');
   await c.init();
   ok(pool.db.media.length === 1080, 'a second start does not load them again');
+  const gen84 = () => pool.db.media.find(r => r.ref_key === '1:8:4' && r.yt === 'w1yiN1YGuzc');
+  ok(gen84() && gen84().active === false, 'a correction hides the Genesis 8:4 video the owner asked to remove');
+  ok(pool.db.content._corrections && pool.db.content._corrections.doc.ids.includes('2026-09-15-remove-genesis-8-4'), '...and is remembered as done');
+  gen84().active = true;                  // an admin puts it back from the admin screen
+  await c.init();
+  ok(gen84().active === true, 'a redeploy never undoes what an admin has done since');
+  gen84().active = false;
+  const mv = () => pool.db.media.find(r => r.yt === 'tY2ZCYDnXa8');
+  const n1 = await applyCorrections(pool, 'bb', [{ id: 't-move', ref: '40:24:2', yt: 'tY2ZCYDnXa8', move_to: '42:21:6', label: 'Luke 21:6 · test' }]);
+  ok(n1 === 1 && mv().ref_key === '42:21:6' && mv().level === 'verse' && mv().label === 'Luke 21:6 · test', 'a correction can move a video to the right verse, with its new label');
+  const n2 = await applyCorrections(pool, 'bb', [{ id: 't-move', ref: '42:21:6', yt: 'tY2ZCYDnXa8', move_to: '43:1:1', label: 'x' }]);
+  ok(n2 === 0 && mv().ref_key === '42:21:6', '...and only once');
+  const n3 = await applyCorrections(pool, 'bb', [{ id: 't-bad', ref: '42:21:6', yt: 'tY2ZCYDnXa8', move_to: '42:21:7' }]);
+  ok(n3 === 0 && mv().ref_key === '42:21:6', 'a move without a label for its new verse is refused');
   const srv = app.listen(0); const port = srv.address().port;
   const call = (method, p, body, token, headers = {}) => new Promise(resolve => {
     const data = body ? JSON.stringify(body) : null;
