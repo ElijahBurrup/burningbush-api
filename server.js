@@ -13,6 +13,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const crypto = require('crypto');
+const { mountContent } = require('./content');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -848,6 +849,10 @@ function adminAuth(req, res, next) {
     req.user = u; next();
   } catch { res.status(401).json({ error: 'Please sign in again.' }); }
 }
+// Videos, announcements, settings, suggested verses and stories: what the owner changes without a
+// release. See content.js.
+const content = mountContent(app, { pool, D, adminAuth, limit });
+
 // a stable key for a ticket: owner-email + submit-timestamp + type
 const ticketKey = (email, t) => `${(email || '').toLowerCase()}|${t.ts}|${t.type || ''}`;
 
@@ -918,5 +923,6 @@ async function sendReset(email, tok) {
 }
 
 initDb()
+  .then(() => content.init())          // never throws: content failing to start must not stop sign-in and sync
   .then(() => app.listen(process.env.PORT || 3000, () => console.log(`burningbush-api up · users="${U}" data="${D}"`)))
   .catch(e => { console.error('DB init failed', e); process.exit(1); });
