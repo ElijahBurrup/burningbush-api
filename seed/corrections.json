@@ -70,5 +70,57 @@
     "yt": "XE9y-SlxW-k",
     "hide": true,
     "why": "John 14:2. Unsure: nothing readable says which verse the clip teaches. Hidden until the owner has listened; restore from Admin > Content > Videos."
+  },
+  {
+    "id": "2026-09-15-song-Q-J0ELBc5oM",
+    "ref": "19:1",
+    "add": {
+      "ref": "19:1",
+      "yt": "Q-J0ELBc5oM",
+      "kind": "hear",
+      "label": "Psalm 1 · 90’s Country Duo",
+      "by": "Burning Bush · 90’s Country Duo Psalms",
+      "sort": 1
+    },
+    "why": "New in the Burning Bush Psalms playlists; songs sit above the teaching."
+  },
+  {
+    "id": "2026-09-15-song-WRvE-9uABYg",
+    "ref": "19:23",
+    "add": {
+      "ref": "19:23",
+      "yt": "WRvE-9uABYg",
+      "kind": "hear",
+      "label": "Psalm 23 · 60’s Choir",
+      "by": "Burning Bush · 60’s Choir Psalms",
+      "sort": -3
+    },
+    "why": "New in the Burning Bush Psalms playlists; songs sit above the teaching."
+  },
+  {
+    "id": "2026-09-15-song-Qqr0Gfc0o-M",
+    "ref": "19:23",
+    "add": {
+      "ref": "19:23",
+      "yt": "Qqr0Gfc0o-M",
+      "kind": "hear",
+      "label": "Psalm 23 · 80’s Ballad",
+      "by": "Burning Bush · 80’s Ballad Psalms",
+      "sort": -2
+    },
+    "why": "New in the Burning Bush Psalms playlists; songs sit above the teaching."
+  },
+  {
+    "id": "2026-09-15-song-_R691TA_LHI",
+    "ref": "19:23",
+    "add": {
+      "ref": "19:23",
+      "yt": "_R691TA_LHI",
+      "kind": "hear",
+      "label": "Psalm 23 · 90’s Country Duo",
+      "by": "Burning Bush · 90’s Country Duo Psalms",
+      "sort": -1
+    },
+    "why": "New in the Burning Bush Psalms playlists; songs sit above the teaching."
   }
 ]

@@ -139,6 +139,20 @@ async function applyCorrections(pool, D, list) {
   let applied = 0;
   for (const k of Array.isArray(list) ? list : []) {
     if (!k || !k.id || done.has(k.id)) continue;
+    // A video the app did not ship with: a new song in a playlist, say. Added once, and never twice,
+    // because the same YouTube id anywhere in the table means it is already there.
+    if (k.add) {
+      const a = k.add, ref = parseRef(a.ref);
+      if (!ref || !a.yt || !String(a.label || '').trim()) { console.warn('[content] correction ' + k.id + ' skipped: an add needs ref, yt and label'); continue; }
+      const dupe = (await pool.query(`SELECT id FROM "${D}".media WHERE yt=$1`, [a.yt])).rows;
+      if (!dupe.length) await pool.query(`INSERT INTO "${D}".media(level, ref_key, kind, yt, label, by_line, sort, created_by)
+          VALUES($1,$2,$3,$4,$5,$6,$7,'correction')`,
+        [ref.level, ref.key, KINDS.includes(a.kind) ? a.kind : 'teach', a.yt, String(a.label).trim().slice(0, 200),
+         String(a.by || '').trim().slice(0, 120), Number.isInteger(a.sort) ? a.sort : 0]);
+      done.add(k.id); applied++;
+      console.log('[content] correction ' + k.id + ': ' + (dupe.length ? 'already there' : 'added ' + a.yt));
+      continue;
+    }
     const to = k.move_to ? parseRef(k.move_to) : null;
     if (!k.hide && (!to || !String(k.label || '').trim())) { console.warn('[content] correction ' + k.id + ' skipped: it needs hide, or move_to with a label'); continue; }
     const hits = (await pool.query(`SELECT id FROM "${D}".media WHERE ref_key=$1 AND (yt=$2 OR fb=$3)`,

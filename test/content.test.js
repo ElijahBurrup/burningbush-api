@@ -56,6 +56,9 @@ function fakePool(mediaRows) {
       db.media.push({ id: nextId++, level: v[0], ref_key: v[1], kind: v[2], yt: v[3], fb: v[4], label: v[5], by_line: v[6], covers: v[7], sort: v[8], active: true });
       return { rows: [] }; }
     if (/^INSERT INTO .*content\(key, doc, updated_by\) VALUES\('_media_seeded'/.test(s)) { db.content._media_seeded = { doc: JSON.parse(v[0]), version: 1 }; return { rows: [] }; }
+    if (/^SELECT id FROM .*media WHERE yt=\$1$/.test(s)) return { rows: db.media.filter(r => r.yt === v[0]) };
+    if (/^INSERT INTO .*media\(level, ref_key, kind, yt, label, by_line, sort, created_by\)/.test(s)) {
+      db.media.push({ id: nextId++, level: v[0], ref_key: v[1], kind: v[2], yt: v[3], label: v[4], by_line: v[5], sort: v[6], active: true }); return { rows: [] }; }
     if (/^SELECT id, level, ref_key/.test(s)) return { rows: db.media.filter(r => r.active) };
     if (/FROM "\w+"\.content WHERE key NOT LIKE/.test(s)) return { rows: Object.entries(db.content).filter(([k]) => !k.startsWith('_')).map(([key, c]) => ({ key, doc: c.doc, version: c.version })) };
     if (/^SELECT id, active FROM .*media WHERE level/.test(s)) return { rows: db.media.filter(r => r.level === v[0] && r.ref_key === v[1] && ((v[2] && r.yt === v[2]) || (v[3] && r.fb === v[3]))) };
@@ -92,9 +95,9 @@ const limit = () => (req, res, next) => next();
   const app = express(); app.use(express.json());
   const c = mountContent(app, { pool, D: 'bb', adminAuth, limit });
   await c.init();
-  ok(pool.db.media.length === 1080, 'the first start loads all 1,080 approved videos');
+  ok(pool.db.media.length === 1084, 'the first start loads all 1,080 approved videos, and the 4 songs added since');
   await c.init();
-  ok(pool.db.media.length === 1080, 'a second start does not load them again');
+  ok(pool.db.media.length === 1084, 'a second start does not load them again');
   const gen84 = () => pool.db.media.find(r => r.ref_key === '1:8:4' && r.yt === 'w1yiN1YGuzc');
   ok(gen84() && gen84().active === false, 'a correction hides the Genesis 8:4 video the owner asked to remove');
   ok(pool.db.content._corrections && pool.db.content._corrections.doc.ids.includes('2026-09-15-remove-genesis-8-4'), '...and is remembered as done');
@@ -107,6 +110,14 @@ const limit = () => (req, res, next) => next();
   ok(pool.db.media.find(r => r.yt === 'zR4wwVSNmHA').ref_key === '2:34:7', 'the generational-curses video is on Exodus 34:7, the verse its episode reads');
   const unsure = ['Cq_USaN_WO4', '5sQZHMWOXnI', 'jYK2vAdRG9c', 'KVOeRNjhu7w', 's1zzzS4xGMQ', '3GoWq3SowLU', 'XE9y-SlxW-k'];
   ok(unsure.every(y => pool.db.media.find(r => r.yt === y).active === false), 'the seven verse videos nobody could confirm are hidden until the owner listens');
+  const tree2 = mediaTree(pool.db.media);
+  ok(tree2.chapter['19:1'].map(x => x.kind).join(',') === 'hear,hear,hear,teach', 'the new 90s Country song joins Psalm 1, songs before the teaching');
+  ok(tree2.chapter['19:23'].map(x => x.kind).join(',') === 'hear,hear,hear,teach', 'Psalm 23 gains all three songs, above its teaching');
+  ok(/60/.test(tree2.chapter['19:23'][0].label) && /80/.test(tree2.chapter['19:23'][1].label) && /Country/.test(tree2.chapter['19:23'][2].label),
+    '...in playlist order: 60s Choir, 80s Ballad, 90s Country Duo');
+  const nBefore = pool.db.media.length;
+  await c.init();
+  ok(pool.db.media.length === nBefore, 'a redeploy does not add the songs again');
   const mv = () => pool.db.media.find(r => r.yt === 'PXaEAAgwo-4');
   const n1 = await applyCorrections(pool, 'bb', [{ id: 't-move', ref: '44:28:1', yt: 'PXaEAAgwo-4', move_to: '44:28:2', label: 'Acts 28:2 · test' }]);
   ok(n1 === 1 && mv().ref_key === '44:28:2' && mv().level === 'verse' && mv().label === 'Acts 28:2 · test', 'a correction can move a video to the right verse, with its new label');
