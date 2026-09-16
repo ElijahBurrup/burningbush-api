@@ -153,6 +153,21 @@ async function applyCorrections(pool, D, list) {
       console.log('[content] correction ' + k.id + ': ' + (dupe.length ? 'already there' : 'added ' + a.yt));
       continue;
     }
+    // A new title (and optionally a new "by" line) for a video that stays where it is.
+    if (k.relabel) {
+      const label = String(k.relabel.label || '').trim().slice(0, 200);
+      const by = k.relabel.by == null ? null : String(k.relabel.by).trim().slice(0, 120);
+      if (!label) { console.warn('[content] correction ' + k.id + ' skipped: a relabel needs a label'); continue; }
+      const hits = (await pool.query(`SELECT id FROM "${D}".media WHERE ref_key=$1 AND (yt=$2 OR fb=$3)`,
+        [k.ref, k.yt || null, k.fb || null])).rows;
+      for (const h of hits) {
+        if (by === null) await pool.query(`UPDATE "${D}".media SET label=$1, updated_at=now(), updated_by='correction' WHERE id=$2`, [label, h.id]);
+        else await pool.query(`UPDATE "${D}".media SET label=$1, by_line=$2, updated_at=now(), updated_by='correction' WHERE id=$3`, [label, by, h.id]);
+      }
+      done.add(k.id); applied++;
+      console.log('[content] correction ' + k.id + ': relabelled ' + hits.length + ' video(s)');
+      continue;
+    }
     const to = k.move_to ? parseRef(k.move_to) : null;
     if (!k.hide && (!to || !String(k.label || '').trim())) { console.warn('[content] correction ' + k.id + ' skipped: it needs hide, or move_to with a label'); continue; }
     const hits = (await pool.query(`SELECT id FROM "${D}".media WHERE ref_key=$1 AND (yt=$2 OR fb=$3)`,

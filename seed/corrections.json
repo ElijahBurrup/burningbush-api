@@ -122,5 +122,59 @@
       "sort": -1
     },
     "why": "New in the Burning Bush Psalms playlists; songs sit above the teaching."
+  },
+  {
+    "id": "2026-09-16-name-RtGcNOsuOYQ",
+    "ref": "19:1",
+    "yt": "RtGcNOsuOYQ",
+    "relabel": {
+      "label": "Psalm 1 · The Still Waters Choir"
+    },
+    "why": "The Psalm song styles became named ensembles: The Still Waters Choir (60s choir), Deep Unto Deep (80s rock ballad), Jordan & Grace (90s country duo)."
+  },
+  {
+    "id": "2026-09-16-name-Ugt0JTLacj8",
+    "ref": "19:1",
+    "yt": "Ugt0JTLacj8",
+    "relabel": {
+      "label": "Psalm 1 · Deep Unto Deep"
+    },
+    "why": "The Psalm song styles became named ensembles: The Still Waters Choir (60s choir), Deep Unto Deep (80s rock ballad), Jordan & Grace (90s country duo)."
+  },
+  {
+    "id": "2026-09-16-name-Q-J0ELBc5oM",
+    "ref": "19:1",
+    "yt": "Q-J0ELBc5oM",
+    "relabel": {
+      "label": "Psalm 1 · Jordan & Grace"
+    },
+    "why": "The Psalm song styles became named ensembles: The Still Waters Choir (60s choir), Deep Unto Deep (80s rock ballad), Jordan & Grace (90s country duo)."
+  },
+  {
+    "id": "2026-09-16-name-WRvE-9uABYg",
+    "ref": "19:23",
+    "yt": "WRvE-9uABYg",
+    "relabel": {
+      "label": "Psalm 23 · The Still Waters Choir"
+    },
+    "why": "The Psalm song styles became named ensembles: The Still Waters Choir (60s choir), Deep Unto Deep (80s rock ballad), Jordan & Grace (90s country duo)."
+  },
+  {
+    "id": "2026-09-16-name-Qqr0Gfc0o-M",
+    "ref": "19:23",
+    "yt": "Qqr0Gfc0o-M",
+    "relabel": {
+      "label": "Psalm 23 · Deep Unto Deep"
+    },
+    "why": "The Psalm song styles became named ensembles: The Still Waters Choir (60s choir), Deep Unto Deep (80s rock ballad), Jordan & Grace (90s country duo)."
+  },
+  {
+    "id": "2026-09-16-name-_R691TA_LHI",
+    "ref": "19:23",
+    "yt": "_R691TA_LHI",
+    "relabel": {
+      "label": "Psalm 23 · Jordan & Grace"
+    },
+    "why": "The Psalm song styles became named ensembles: The Still Waters Choir (60s choir), Deep Unto Deep (80s rock ballad), Jordan & Grace (90s country duo)."
   }
 ]

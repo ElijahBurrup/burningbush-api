@@ -113,8 +113,12 @@ const limit = () => (req, res, next) => next();
   const tree2 = mediaTree(pool.db.media);
   ok(tree2.chapter['19:1'].map(x => x.kind).join(',') === 'hear,hear,hear,teach', 'the new 90s Country song joins Psalm 1, songs before the teaching');
   ok(tree2.chapter['19:23'].map(x => x.kind).join(',') === 'hear,hear,hear,teach', 'Psalm 23 gains all three songs, above its teaching');
-  ok(/60/.test(tree2.chapter['19:23'][0].label) && /80/.test(tree2.chapter['19:23'][1].label) && /Country/.test(tree2.chapter['19:23'][2].label),
-    '...in playlist order: 60s Choir, 80s Ballad, 90s Country Duo');
+  ok(tree2.chapter['19:23'].slice(0, 3).map(x => x.label).join(' | ') === 'Psalm 23 · The Still Waters Choir | Psalm 23 · Deep Unto Deep | Psalm 23 · Jordan & Grace',
+    '...in playlist order, under their ensembles\' names');
+  ok(tree2.chapter['19:1'].slice(0, 3).map(x => x.label).join(' | ') === 'Psalm 1 · The Still Waters Choir | Psalm 1 · Deep Unto Deep | Psalm 1 · Jordan & Grace',
+    'Psalm 1\'s songs are renamed too');
+  const n4 = await applyCorrections(pool, 'bb', [{ id: 't-relabel-empty', ref: '19:1', yt: 'RtGcNOsuOYQ', relabel: { label: ' ' } }]);
+  ok(n4 === 0 && tree2.chapter['19:1'][0].label === 'Psalm 1 · The Still Waters Choir', 'a relabel with no title is refused');
   const nBefore = pool.db.media.length;
   await c.init();
   ok(pool.db.media.length === nBefore, 'a redeploy does not add the songs again');
