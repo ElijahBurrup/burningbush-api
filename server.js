@@ -10,6 +10,8 @@
 const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
+const { makeVerifier, confirmIdentity, mountGoogleAuth } = require('./google-auth');
+const { TERMS_VERSION, ddl: legalDdl, mountLegal, hasAccepted } = require('./legal');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -97,6 +99,14 @@ async function initDb() {
       pw_hash TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT now()
     );
+    -- Sign in with Google (2026-09-17). An account made through Google has no password at all, so
+    -- pw_hash stops being required; google_sub is Google's own id for the person, which never
+    -- changes even if they change their address, and is what a returning Google sign-in is found by.
+    ALTER TABLE "${U}".users ALTER COLUMN pw_hash DROP NOT NULL;
+    ALTER TABLE "${U}".users ADD COLUMN IF NOT EXISTS google_sub TEXT;
+    ALTER TABLE "${U}".users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE;
+    CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub_key ON "${U}".users(google_sub) WHERE google_sub IS NOT NULL;
+    ${legalDdl(U)}
     CREATE TABLE IF NOT EXISTS "${U}".reset_tokens (
       token TEXT PRIMARY KEY,
       user_id BIGINT REFERENCES "${U}".users(id) ON DELETE CASCADE,
@@ -439,6 +449,12 @@ app.get('/api/entitlement', auth, async (req, res) => {
    follows back to this user. */
 app.post('/api/checkout', auth, limit(20, 60000), async (req, res) => {
   if (!stripe) return res.status(503).json({ error: 'Checkout is not set up yet.' });
+  // Nobody reaches a payment page without an acceptance of the current terms on file. The app ticks
+  // the box and records it first; this is the check that makes the box mean something.
+  try {
+    if (!(await hasAccepted(pool, U, req.user.uid, TERMS_VERSION)))
+      return res.status(428).json({ error: 'Please accept the Terms of Service first.', needsTerms: TERMS_VERSION });
+  } catch (e) { console.error('checkout-terms', e); return res.status(500).json({ error: 'Server error.' }); }
   const plan = req.body && req.body.plan === 'monthly' ? 'monthly' : 'yearly';
   const price = PRICES[plan];
   if (!price) return res.status(503).json({ error: 'That plan is not set up yet.' });
@@ -483,6 +499,23 @@ app.post('/api/portal', auth, limit(20, 60000), async (req, res) => {
 
 app.get('/api/health', (req, res) => res.json({ ok: true, product: PRODUCT, users: U, data: D }));
 
+/* Stamp the sign-in, but never fail a login over it: the report is not worth a locked-out reader. */
+function stampLogin(uid) {
+  pool.query(
+    `INSERT INTO "${D}".user_meta(user_id, last_login_at, logins) VALUES($1, now(), 1)
+     ON CONFLICT(user_id) DO UPDATE SET last_login_at=now(), logins="${D}".user_meta.logins + 1`,
+    [uid]).catch(e => console.error('login-stamp', e.message));
+}
+
+/* Sign in with Google, where it has been set up (GOOGLE_CLIENT_IDS). Verified here, on the server:
+   see google-auth.js. Without the setting the route says so and email sign-in carries on. */
+const verifyGoogle = makeVerifier();
+console.log('[boot] Google sign-in: ' + (verifyGoogle ? 'on' : 'off (set GOOGLE_CLIENT_IDS to turn it on)'));
+mountGoogleAuth(app, { pool, U, sign, limit, verify: verifyGoogle, stampLogin });
+
+/* Accepting the terms, recorded per account and required before checkout: see legal.js. */
+mountLegal(app, { pool, U, auth, limit });
+
 app.post('/api/signup', limit(10, 60000), async (req, res) => {
   try {
     const email = (req.body.email || '').trim().toLowerCase(), pw = req.body.password || '';
@@ -491,7 +524,18 @@ app.post('/api/signup', limit(10, 60000), async (req, res) => {
     const hash = await bcrypt.hash(pw, 10);
     let r;
     try { r = await pool.query(`INSERT INTO "${U}".users(email, pw_hash) VALUES($1,$2) RETURNING id, email`, [email, hash]); }
-    catch (e) { if (e.code === '23505') return res.status(409).json({ error: 'That email already has a Kingdom Builders account — sign in instead.' }); throw e; }
+    catch (e) {
+      if (e.code === '23505') {
+        // Already taken — but by which kind of account? Sending a Google user to a password form
+        // they can never fill is the most confusing dead end in any sign-up.
+        const held = await pool.query(`SELECT pw_hash FROM "${U}".users WHERE email=$1`, [email]);
+        const googleOnly = held.rows.length && !held.rows[0].pw_hash;
+        return res.status(409).json({ error: googleOnly
+          ? 'That email signs in with Google — use Continue with Google.'
+          : 'That email already has a Kingdom Builders account — sign in instead.' });
+      }
+      throw e;
+    }
     const u = r.rows[0];
     res.json({ token: sign(u), email: u.email });
   } catch (e) { console.error('signup', e); res.status(500).json({ error: 'Server error. Please try again.' }); }
@@ -503,13 +547,12 @@ app.post('/api/login', limit(15, 60000), async (req, res) => {
     const r = await pool.query(`SELECT id, email, pw_hash FROM "${U}".users WHERE email=$1`, [email]);
     if (!r.rows.length) return res.status(401).json({ error: 'No account found with that email.' });
     const u = r.rows[0];
+    // An account made through Google has no password to compare: say so plainly rather than
+    // "Incorrect password" for a password that was never set.
+    if (!u.pw_hash) return res.status(401).json({ error: 'This account signs in with Google — use Continue with Google.' });
     if (!(await bcrypt.compare(pw, u.pw_hash))) return res.status(401).json({ error: 'Incorrect password.' });
-    // Stamp the sign-in, but never fail a login over it: the report is not worth a locked-out reader.
-    pool.query(
-      `INSERT INTO "${D}".user_meta(user_id, last_login_at, logins) VALUES($1, now(), 1)
-       ON CONFLICT(user_id) DO UPDATE SET last_login_at=now(), logins="${D}".user_meta.logins + 1`,
-      [u.id]).catch(e => console.error('login-stamp', e.message));
-    res.json({ token: sign(u), email: u.email });
+    stampLogin(u.id);
+    res.json({ token: sign(u), email: u.email, provider: 'email', hasPassword: true });
   } catch (e) { console.error('login', e); res.status(500).json({ error: 'Server error. Please try again.' }); }
 });
 
@@ -558,13 +601,18 @@ app.post('/api/account/delete', auth, limit(6, 60000), async (req, res) => {
     const pw = req.body.password || '';
     const confirm = (req.body.email || '').trim().toLowerCase();
 
-    const r = await client.query(`SELECT id, email, pw_hash FROM "${U}".users WHERE id=$1`, [req.user.uid]);
+    const r = await client.query(`SELECT id, email, pw_hash, google_sub FROM "${U}".users WHERE id=$1`, [req.user.uid]);
     if (!r.rows.length) return res.status(404).json({ error: 'That account no longer exists.' });
     const u = r.rows[0];
     if (confirm !== String(u.email).toLowerCase())
       return res.status(400).json({ error: 'Type your email address exactly to confirm.' });
-    if (!(await bcrypt.compare(pw, u.pw_hash)))
-      return res.status(401).json({ error: 'Incorrect password.' });
+    // The password, or — for an account that signs in with Google and so has none — signing in with
+    // Google again, right now (owner's decision, 2026-09-17).
+    const refused = await confirmIdentity({
+      user: u, password: pw, credential: req.body.googleCredential,
+      verify: verifyGoogle, compare: bcrypt.compare,
+    });
+    if (refused) return res.status(401).json({ error: refused });
 
     // Stop the money first. If this fails the deletion still goes ahead — an account that no longer
     // exists must not keep being charged, and a stranded Stripe subscription is recoverable by hand

@@ -28,5 +28,9 @@ services:
         sync: false
       - key: BIBLE_NLT_ID
         value: d6e14a625393b4da-01
+      # - key: GOOGLE_CLIENT_IDS (optional: turns on Sign in with Google. The OAuth client ids
+      #                            allowed to sign in — the Web client, and the Android one later,
+      #                            comma-separated. Without it /api/auth/google answers 503 and the
+      #                            app shows no Google button.)
       # - key: SENDGRID_API_KEY  (optional: enables password-reset emails)
       # - key: MAIL_FROM         (verified sender)
