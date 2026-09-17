@@ -927,7 +927,7 @@ app.post('/api/admin/tickets/delete', adminAuth, async (req, res) => {
    Two of those are read out of the reader's own progress blob, which is client-owned, so both carry
    a flag saying whether the number is the real one or the best that could be made of an account
    that predates the field. The app started recording `lastLesson` and the monthly `g` tally in
-   v2.21.0; before that there is no lesson history (doneSkills is a set of ids with no dates) and no
+   v2.21.11; before that there is no lesson history (doneSkills is a set of ids with no dates) and no
    lifetime goal tally (the goal log keeps a fortnight). Rather than show a blank for everybody who
    has not used the app since, those fall back to the last id in doneSkills and to the fortnight in
    the log — marked estimated, so a guess is never read as a measurement.

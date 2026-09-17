@@ -1,7 +1,7 @@
 /* What an admin report can honestly say about one account, read out of its progress blob.
    Kept apart from server.js so it can be tested without a database: everything here is pure.
 
-   Two of these numbers depend on fields the app only started writing in v2.21.0. An account that
+   Two of these numbers depend on fields the app only started writing in v2.21.11. An account that
    has not been opened since has no lesson stamp and no monthly goal tally, so each falls back to
    the best the older data can give — the tail of doneSkills, which is append-only, and the fortnight
    the goal log keeps — and says so. A guess that reads as a measurement is worse than a blank. */
