@@ -31,6 +31,14 @@ ok(old.lastLessonId === 'book:5' && old.lastLessonAt === null, 'the tail of done
 ok(old.lastLessonEst === true, 'a lesson read from the order it was finished in is flagged');
 ok(old.goalUnits === 6 && old.goalUnitsEst === true, 'the fortnight plus today stands in, and is flagged');
 
+// doneSkills holds films and a couple of internal ids as well as lessons. Reading its tail blind
+// reported "video:verse" as a reader's last lesson, which is not a lesson at all.
+const filmy = readProgress(J({ doneSkills: ['snd:0-4', 'book:5', 'video:verse', 'numtest:73'] }));
+ok(filmy.lastLessonId === 'book:5', 'a film at the end of the list is not the last lesson');
+ok(readProgress(J({ doneSkills: ['video:intro'] })).lastLessonId === null, 'films alone leave no lesson to report');
+ok(readProgress(J({ doneSkills: ['story:12'] })).lastLessonId === 'story:12', 'a Bible story is a lesson');
+ok(readProgress(J({ doneSkills: ['palace:0'] })).lastLessonId === 'palace:0', '...and so is a palace');
+
 // A stamped lesson wins even when doneSkills has something later in it: the stamp is the record of
 // what was last DONE, and doneSkills never records a repeat at all.
 const both = readProgress(J({ lastLesson: { id: 'snd:5-9', at: now }, doneSkills: ['book:1', 'book:2'] }));

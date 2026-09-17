@@ -5,6 +5,11 @@
    has not been opened since has no lesson stamp and no monthly goal tally, so each falls back to
    the best the older data can give — the tail of doneSkills, which is append-only, and the fortnight
    the goal log keeps — and says so. A guess that reads as a measurement is worse than a blank. */
+/* doneSkills holds more than lessons: a film marks itself done there (video:verse), and so do a
+   couple of internal ids (numtest:73). Reading its tail blind reported a film as somebody's last
+   lesson, so the fallback only accepts the kinds the learn path actually teaches. */
+const LESSON_KINDS = /^(snd|num|book|peg|palace|story):/;
+
 function readProgress(progJson) {
   const out = { lastLessonId: null, lastLessonAt: null, lastLessonEst: false,
                 goalUnits: 0, goalUnitsEst: false, verses: 0, daysActive: 0 };
@@ -16,9 +21,15 @@ function readProgress(progJson) {
   if (last && last.id) {
     out.lastLessonId = String(last.id);
     out.lastLessonAt = Number(last.at) || null;
-  } else if (Array.isArray(p.doneSkills) && p.doneSkills.length) {
-    out.lastLessonId = String(p.doneSkills[p.doneSkills.length - 1]);
-    out.lastLessonEst = true;                      // the order it was finished in, with no day attached
+  } else if (Array.isArray(p.doneSkills)) {
+    for (let i = p.doneSkills.length - 1; i >= 0; i--) {
+      const id = String(p.doneSkills[i] || '');
+      if (LESSON_KINDS.test(id)) {
+        out.lastLessonId = id;
+        out.lastLessonEst = true;                  // the order it was finished in, with no day attached
+        break;
+      }
+    }
   }
 
   const stats = (p.stats && typeof p.stats === 'object') ? p.stats : {};
