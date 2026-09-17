@@ -14,6 +14,7 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const crypto = require('crypto');
 const { mountContent } = require('./content');
+const { readProgress } = require('./report');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -167,6 +168,15 @@ async function initDb() {
       done BOOLEAN DEFAULT false,
       deleted BOOLEAN DEFAULT false,
       updated_at TIMESTAMPTZ DEFAULT now()
+    );
+    -- When somebody last signed IN to this product, which nothing else records: the token lasts a
+    -- year, so a sign-in is a rare event and the sync clock is the better measure of use. Kept here
+    -- rather than as a column on the shared "${U}".users because a Playbooks login is not a Burning
+    -- Bush login, and the shared identity table is read by every product.
+    CREATE TABLE IF NOT EXISTS "${D}".user_meta (
+      user_id BIGINT PRIMARY KEY REFERENCES "${U}".users(id) ON DELETE CASCADE,
+      last_login_at TIMESTAMPTZ,
+      logins INT DEFAULT 0
     );
   `);
 }
@@ -494,6 +504,11 @@ app.post('/api/login', limit(15, 60000), async (req, res) => {
     if (!r.rows.length) return res.status(401).json({ error: 'No account found with that email.' });
     const u = r.rows[0];
     if (!(await bcrypt.compare(pw, u.pw_hash))) return res.status(401).json({ error: 'Incorrect password.' });
+    // Stamp the sign-in, but never fail a login over it: the report is not worth a locked-out reader.
+    pool.query(
+      `INSERT INTO "${D}".user_meta(user_id, last_login_at, logins) VALUES($1, now(), 1)
+       ON CONFLICT(user_id) DO UPDATE SET last_login_at=now(), logins="${D}".user_meta.logins + 1`,
+      [u.id]).catch(e => console.error('login-stamp', e.message));
     res.json({ token: sign(u), email: u.email });
   } catch (e) { console.error('login', e); res.status(500).json({ error: 'Server error. Please try again.' }); }
 });
@@ -903,6 +918,72 @@ app.post('/api/admin/tickets/delete', adminAuth, async (req, res) => {
        ON CONFLICT(ticket_key) DO UPDATE SET deleted=true, updated_at=now()`, [key]);
     res.json({ ok: true });
   } catch (e) { console.error('admin-delete', e); res.status(500).json({ error: 'Server error.' }); }
+});
+
+/* ---- admin: who is using this thing ------------------------------------------------------------
+   One row per account: the email, when they last signed in, when their progress last reached us,
+   the last lesson they finished and the goal units they have earned.
+
+   Two of those are read out of the reader's own progress blob, which is client-owned, so both carry
+   a flag saying whether the number is the real one or the best that could be made of an account
+   that predates the field. The app started recording `lastLesson` and the monthly `g` tally in
+   v2.21.0; before that there is no lesson history (doneSkills is a set of ids with no dates) and no
+   lifetime goal tally (the goal log keeps a fortnight). Rather than show a blank for everybody who
+   has not used the app since, those fall back to the last id in doneSkills and to the fortnight in
+   the log — marked estimated, so a guess is never read as a measurement.
+
+   Counts and timestamps only. Nothing anybody wrote — scenes, verses, tickets — is in this.
+   The reading itself is in report.js, which is pure and therefore testable without a database. */
+let adminUsersCache = { at: 0, data: null };
+
+app.get('/api/admin/users', adminAuth, async (req, res) => {
+  try {
+    if (adminUsersCache.data && Date.now() - adminUsersCache.at < 60000 && !req.query.fresh)
+      return res.json(adminUsersCache.data);
+    const rows = (await pool.query(
+      `SELECT u.id, u.email, u.created_at,
+              m.last_login_at, m.logins,
+              p.prog_json, p.saved_at, p.updated_at,
+              s.status AS sub_status, s.plan AS sub_plan, s.period_end
+         FROM "${U}".users u
+         LEFT JOIN "${D}".user_meta m ON m.user_id = u.id
+         LEFT JOIN "${D}".progress  p ON p.user_id = u.id
+         LEFT JOIN "${D}".subscriptions s ON s.user_id = u.id
+        ORDER BY u.id`)).rows;
+
+    // A seat on somebody's group licence is Pro too, and asking per user would be one query each.
+    const seated = new Set((await pool.query(
+      `SELECT DISTINCT s.user_id FROM "${D}".licence_seats s
+         JOIN "${D}".licences l ON l.id = s.licence_id
+        WHERE s.released_at IS NULL AND l.status='active'
+          AND (l.term_end IS NULL OR l.term_end > EXTRACT(EPOCH FROM now()))`)).rows
+      .map(r => String(r.user_id)));
+
+    const users = rows.map(r => {
+      const g = readProgress(r.prog_json);
+      const subRow = { status: r.sub_status, period_end: r.period_end };
+      return {
+        email: r.email,
+        createdAt: r.created_at ? new Date(r.created_at).getTime() : null,
+        lastLoginAt: r.last_login_at ? new Date(r.last_login_at).getTime() : null,
+        logins: Number(r.logins) || 0,
+        // The sync clock: the app writes on every save, so this is when they last did anything.
+        lastSyncAt: r.saved_at ? new Date(r.saved_at).getTime() : null,
+        lastLesson: g.lastLessonId,
+        lastLessonAt: g.lastLessonAt,
+        lastLessonEstimated: g.lastLessonEst,
+        goalUnits: g.goalUnits,
+        goalUnitsEstimated: g.goalUnitsEst,
+        verses: g.verses,
+        daysActive: g.daysActive,
+        pro: isPaid(subRow) || seated.has(String(r.id)),
+        plan: isPaid(subRow) ? (r.sub_plan || null) : (seated.has(String(r.id)) ? 'group-seat' : null)
+      };
+    });
+    const data = { users, count: users.length, at: Date.now() };
+    adminUsersCache = { at: Date.now(), data };
+    res.json(data);
+  } catch (e) { console.error('admin-users', e); res.status(500).json({ error: 'Server error.' }); }
 });
 
 async function sendReset(email, tok) {
